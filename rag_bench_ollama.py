@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import os, sys, json, time, argparse, re, math, hashlib
 from typing import List, Dict
 import requests
