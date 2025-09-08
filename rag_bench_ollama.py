@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import os, sys, json, time, argparse, re, math, hashlib
 from typing import List, Dict
 import requests
@@ -167,7 +167,7 @@ def eval_model(model_name: str, ds, emb, index, chunks, chunk_src_map, contexts,
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=["llama3.2:1b","gemma:2b-instruct","qwen3:1.7b"])
+    ap.add_argument("--models", nargs="+", default=["llama3.2:1b","gemma:2b-instruct","qwen3:1.7b", "scb10x/typhoon-ocr-7b:latest"])
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--n", type=int, default=200, help="จำนวนตัวอย่างที่จะทดสอบ")
     ap.add_argument("--embed", type=str, default="BAAI/bge-m3")

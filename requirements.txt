@@ -7,3 +7,4 @@ sentence-transformers
 faiss-cpu
 # faiss-gpu
 requests
+python-crfsuite
