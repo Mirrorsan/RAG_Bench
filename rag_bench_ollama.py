@@ -12,7 +12,12 @@ from pythainlp.tokenize import sent_tokenize, word_tokenize
 from sentence_transformers import SentenceTransformer
 import faiss
 
+
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+def model_to_fname(m: str) -> str:
+    # แทนที่ทุกตัวอักษรที่ไม่ใช่ [A-Za-z0-9._-] ด้วย '_'
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', m)
 
 # -----------------------------
 # Utils: metrics (EM/F1, recall)
@@ -206,7 +211,9 @@ def main():
 
     for m in args.models:
         df, summ = eval_model(m, ds, emb, index, chunks, chunk_src, contexts, k=args.k, n=args.n)
-        out_csv = f"runs/results_{m.replace(':','_')}.csv"
+        #out_csv = f"runs/results_{m.replace(':','_')}.csv"
+        safe_name = model_to_fname(m)
+        out_csv = f"runs/results_{safe_name}.csv"
         df.to_csv(out_csv, index=False)
         print(f"\n[{m}] summary: {summ}  -> saved: {out_csv}")
         summ["model"] = m
