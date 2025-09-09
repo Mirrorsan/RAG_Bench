@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# หากตั้งค่านี้จะปิด GPU: os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import os, sys, json, time, argparse, re, math, hashlib
 from typing import List, Dict
 import requests
@@ -11,12 +10,11 @@ from datasets import load_dataset
 from pythainlp.tokenize import sent_tokenize, word_tokenize
 from sentence_transformers import SentenceTransformer
 import faiss
-
+import torch  # NEW
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 def model_to_fname(m: str) -> str:
-    # แทนที่ทุกตัวอักษรที่ไม่ใช่ [A-Za-z0-9._-] ด้วย '_'
     return re.sub(r'[^A-Za-z0-9._-]+', '_', m)
 
 # -----------------------------
@@ -27,7 +25,6 @@ def normalize_text(s: str) -> str:
     return _ws.sub(" ", s.strip().lower())
 
 def thai_tokens(s: str) -> List[str]:
-    # ใช้ newmm (ดีพอสำหรับ F1 เบื้องต้น)
     toks = word_tokenize(s.strip(), engine="newmm")
     return [t.strip() for t in toks if t.strip()]
 
@@ -53,16 +50,12 @@ def em_and_f1(pred: str, golds: List[str]) -> (float, float):
 # Load ThaiQA (train/dev)
 # -----------------------------
 def load_thai_split():
-    # XQuAD Thai ใช้ split 'validation' ชุดเดียว ~1,190 ตัวอย่าง
-    from datasets import load_dataset
-    return load_dataset("google/xquad", "xquad.th", split="validation")  # <- สำคัญ!
-
+    return load_dataset("google/xquad", "xquad.th", split="validation")
 
 # -----------------------------
 # Chunking & Embeddings & Index
 # -----------------------------
 def build_chunks_from_contexts(contexts: List[str], target_len=700, overlap=120) -> (List[str], List[int]):
-    """Return chunks list + mapping to source doc index."""
     chunks, src = [], []
     for idx, d in enumerate(contexts):
         sents = sent_tokenize(d)
@@ -82,11 +75,30 @@ def build_chunks_from_contexts(contexts: List[str], target_len=700, overlap=120)
             chunks.append(" ".join(buf)); src.append(idx)
     return chunks, src
 
-def build_index(chunks: List[str], model_name="BAAI/bge-m3"):
-    emb = SentenceTransformer(model_name)
-    vecs = emb.encode(chunks, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=True)
-    index = faiss.IndexFlatIP(vecs.shape[1]); index.add(vecs)
-    return emb, index
+def build_embeddings_gpu(chunks: List[str], model_name="BAAI/bge-m3", batch_size=128):
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU unavailable: torch.cuda.is_available() == False")
+    device = "cuda"
+    emb = SentenceTransformer(model_name, device=device)
+    # เข้ารหัสบน GPU
+    vecs = emb.encode(
+        chunks,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+        batch_size=batch_size,
+        device=device,
+    )
+    return emb, vecs
+
+def build_faiss_gpu_index(vecs: np.ndarray):
+    if faiss.get_num_gpus() <= 0:
+        raise RuntimeError("FAISS GPU unavailable: faiss.get_num_gpus() == 0 (ติดตั้ง faiss-gpu แล้วหรือยัง?)")
+    res = faiss.StandardGpuResources()
+    d = vecs.shape[1]
+    index = faiss.GpuIndexFlatIP(res, d)
+    index.add(vecs.astype(np.float32))
+    return index
 
 # -----------------------------
 # Ollama inference
@@ -115,17 +127,12 @@ def ollama_generate(model: str, prompt: str, num_ctx=8192, num_predict=256, temp
 # -----------------------------
 # Naive RAG ask()
 # -----------------------------
-def rag_ask(question: str, k: int, emb, index, chunks: List[str]):
-    qv = emb.encode([question], normalize_embeddings=True, convert_to_numpy=True, normalize_to_unit=True)
+def rag_ask(question: str, k: int, emb: SentenceTransformer, index, chunks: List[str]):
+    # เข้ารหัส query บน GPU เช่นกัน
+    qv = emb.encode([question], normalize_embeddings=True, convert_to_numpy=True, device="cuda")
     D, I = index.search(qv, k)
     ctxs = [chunks[i] for i in I[0]]
     ctx = "\n\n".join([f"[{j+1}] {c}" for j, c in enumerate(ctxs)])
-    # prompt = (
-    #    "คุณเป็นผู้ช่วยตอบคำถามโดยใช้ข้อมูลอ้างอิงเท่านั้น ถ้าไม่พบคำตอบให้บอกว่าไม่ทราบ\n"
-    #    f"ข้อมูลอ้างอิง:\n{ctx}\n\n"
-    #    f"คำถาม: {question}\n"
-    #    "คำตอบเป็นภาษาไทย กระชับ ถูกต้อง และอ้างอิงเฉพาะข้อมูลข้างต้นเท่านั้น:"
-    #)
     prompt = (
         "### บทบาท ###\n"
         "คุณคือผู้ช่วย AI ที่เชี่ยวชาญด้านการค้นหาและสรุปข้อมูล หน้าที่ของคุณคือการตอบคำถามโดยอ้างอิงจาก \"บริบท\" ที่ให้มาอย่างเคร่งครัด\n\n"
@@ -141,6 +148,7 @@ def rag_ask(question: str, k: int, emb, index, chunks: List[str]):
         "### คำตอบ ###"
     )
     return prompt, ctxs
+
 # -----------------------------
 # Evaluate one model
 # -----------------------------
@@ -151,15 +159,11 @@ def eval_model(model_name: str, ds, emb, index, chunks, chunk_src_map, contexts,
         row = ds[i]
         q = row["question"]
         golds = row["answers"]["text"] if isinstance(row["answers"]["text"], list) else [row["answers"]["text"]]
-        gold_ctx = row["context"]
-
         prompt, retrieved_ctxs = rag_ask(q, k, emb, index, chunks)
         pred = ollama_generate(model_name, prompt)
 
-        # metrics
         em, f1 = em_and_f1(pred, golds)
 
-        # retrieval recall@k: มี "คำตอบจริงอย่างน้อยหนึ่งคำ" อยู่ในเอกสารที่ดึงมาหรือไม่
         found = False
         for c in retrieved_ctxs:
             for g in golds:
@@ -181,21 +185,40 @@ def eval_model(model_name: str, ds, emb, index, chunks, chunk_src_map, contexts,
     return df, summary
 
 # -----------------------------
+# Diagnostics
+# -----------------------------
+def print_gpu_status():
+    print("==== GPU STATUS ====")
+    try:
+        print("PyTorch CUDA available:", torch.cuda.is_available())
+        if torch.cuda.is_available():
+            print("Torch device:", torch.cuda.get_device_name(0))
+            print("torch.version.cuda:", torch.version.cuda)
+    except Exception as e:
+        print("Torch check error:", e)
+    try:
+        print("FAISS #GPUs:", faiss.get_num_gpus())
+    except Exception as e:
+        print("FAISS GPU check error:", e)
+    print("====================")
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=["llama3.2:1b","gemma:2b-instruct","qwen3:1.7b", "scb10x/typhoon-ocr-7b:latest"])
+    ap.add_argument("--models", nargs="+", default=["llama3.2:1b","gemma:2b-instruct","qwen3:1.7b","scb10x/typhoon-ocr-7b:latest"])
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--n", type=int, default=200, help="จำนวนตัวอย่างที่จะทดสอบ")
     ap.add_argument("--embed", type=str, default="BAAI/bge-m3")
+    ap.add_argument("--embed-batch", type=int, default=128)
     args = ap.parse_args()
+
+    print_gpu_status()
 
     print("โหลดชุดข้อมูล thaiqa_squad ...")
     ds = load_thai_split()
 
-
-    # สร้างคลังเอกสารจาก context ทั้งหมด (unique)
     contexts = list({r["context"] for r in ds})
     print(f"contexts: {len(contexts)}")
 
@@ -203,15 +226,17 @@ def main():
     chunks, chunk_src = build_chunks_from_contexts(contexts, target_len=700, overlap=120)
     print(f"chunks: {len(chunks)}")
 
-    print(f"ฝังเอกสารด้วย {args.embed} และสร้าง FAISS index ...")
-    emb, index = build_index(chunks, model_name=args.embed)
+    print(f"ฝังเอกสารด้วย {args.embed} (GPU) ...")
+    emb, vecs = build_embeddings_gpu(chunks, model_name=args.embed, batch_size=args.embed_batch)
+
+    print("สร้าง FAISS GPU index ...")
+    index = build_faiss_gpu_index(vecs)
 
     all_summaries = []
     os.makedirs("runs", exist_ok=True)
 
     for m in args.models:
         df, summ = eval_model(m, ds, emb, index, chunks, chunk_src, contexts, k=args.k, n=args.n)
-        #out_csv = f"runs/results_{m.replace(':','_')}.csv"
         safe_name = model_to_fname(m)
         out_csv = f"runs/results_{safe_name}.csv"
         df.to_csv(out_csv, index=False)

@@ -4,7 +4,6 @@ tqdm
 datasets
 pythainlp
 sentence-transformers
-faiss-cpu
-# faiss-gpu
+faiss-gpu
 requests
 python-crfsuite
